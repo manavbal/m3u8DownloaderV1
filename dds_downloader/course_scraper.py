@@ -1,10 +1,12 @@
 """
 Course Scraper for DDS Downloader
 Parses Teachable course pages to extract structure, videos, and downloadable files.
+Uses Playwright for dynamic content that requires JavaScript execution.
 """
 
 import re
 import json
+import time
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Callable, Set
 from urllib.parse import urljoin, urlparse
@@ -69,6 +71,63 @@ class CourseScraper:
         })
         # Track seen URLs to avoid duplicates
         self._seen_urls: Set[str] = set()
+
+        # Playwright browser instance (lazy initialization)
+        self._browser = None
+        self._playwright = None
+        self._browser_context = None
+
+    def _init_browser(self):
+        """Initialize Playwright browser for JavaScript rendering."""
+        if self._browser is not None:
+            return
+
+        try:
+            from playwright.sync_api import sync_playwright
+
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch(headless=True)
+
+            # Create context with cookies
+            self._browser_context = self._browser.new_context(
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+
+            # Add cookies to context
+            cookie_list = []
+            for name, value in self.cookies.items():
+                cookie_list.append({
+                    'name': name,
+                    'value': value,
+                    'domain': '.ddssuccess.com',
+                    'path': '/'
+                })
+
+            if cookie_list:
+                self._browser_context.add_cookies(cookie_list)
+
+            print("Browser initialized for JavaScript rendering")
+
+        except Exception as e:
+            print(f"Failed to initialize browser: {e}")
+            print("Falling back to HTTP requests (videos may not be detected)")
+            self._browser = None
+
+    def close_browser(self):
+        """Close the Playwright browser."""
+        try:
+            if self._browser_context:
+                self._browser_context.close()
+            if self._browser:
+                self._browser.close()
+            if self._playwright:
+                self._playwright.stop()
+        except:
+            pass
+        finally:
+            self._browser = None
+            self._playwright = None
+            self._browser_context = None
 
     def get_course_info(self, url: str, progress_callback: Optional[Callable] = None) -> Optional[Course]:
         """
@@ -323,17 +382,57 @@ class CourseScraper:
     def get_lesson_details(self, lesson: Lesson, progress_callback: Optional[Callable] = None) -> Lesson:
         """
         Fetch detailed information for a lesson including M3U8 URL and downloadable files.
+        Uses Playwright to render JavaScript and detect Wistia videos.
         """
         try:
             print(f"Fetching details for: {lesson.title}")
-            response = self.session.get(lesson.url, timeout=30)
-            response.raise_for_status()
 
-            soup = BeautifulSoup(response.text, 'lxml')
-            html_content = response.text
+            # Initialize browser if not already done
+            self._init_browser()
 
-            # Extract M3U8 URL
-            m3u8_url = self._extract_m3u8_url(soup, html_content)
+            html_content = None
+            wistia_id = None
+
+            # Try Playwright first (for JS-rendered content)
+            if self._browser_context:
+                try:
+                    page = self._browser_context.new_page()
+                    page.goto(lesson.url, wait_until='networkidle', timeout=30000)
+
+                    # Wait for Wistia to load (give it time to initialize)
+                    time.sleep(2)
+
+                    # Try to find Wistia video ID from the rendered page
+                    wistia_id = self._extract_wistia_id_from_page(page)
+
+                    # Also get the HTML for file detection
+                    html_content = page.content()
+
+                    page.close()
+
+                except Exception as e:
+                    print(f"  Playwright error: {e}")
+                    # Fall back to HTTP request
+                    pass
+
+            # Fallback to HTTP request if Playwright didn't work
+            if html_content is None:
+                response = self.session.get(lesson.url, timeout=30)
+                response.raise_for_status()
+                html_content = response.text
+
+            soup = BeautifulSoup(html_content, 'lxml')
+
+            # Extract M3U8 URL - first try Wistia ID from Playwright
+            m3u8_url = None
+            if wistia_id:
+                print(f"  Found Wistia ID via browser: {wistia_id}")
+                m3u8_url = self._get_wistia_m3u8(wistia_id)
+
+            # If no Wistia ID from browser, try parsing the HTML
+            if not m3u8_url:
+                m3u8_url = self._extract_m3u8_url(soup, html_content)
+
             if m3u8_url:
                 print(f"  Found M3U8: {m3u8_url[:80]}...")
                 lesson.m3u8_url = m3u8_url
@@ -350,6 +449,76 @@ class CourseScraper:
             print(f"Error getting lesson details for {lesson.title}: {e}")
 
         return lesson
+
+    def _extract_wistia_id_from_page(self, page) -> Optional[str]:
+        """Extract Wistia video ID from a rendered Playwright page."""
+        try:
+            # Method 1: Look for wistia_async_ class in the DOM
+            wistia_elem = page.query_selector('[class*="wistia_async_"]')
+            if wistia_elem:
+                class_attr = wistia_elem.get_attribute('class')
+                match = re.search(r'wistia_async_([a-zA-Z0-9]+)', class_attr)
+                if match:
+                    return match.group(1)
+
+            # Method 2: Look for Wistia embed divs
+            wistia_embed = page.query_selector('[class*="wistia_embed"]')
+            if wistia_embed:
+                wistia_id = wistia_embed.get_attribute('id')
+                if wistia_id:
+                    match = re.search(r'wistia_([a-zA-Z0-9]+)', wistia_id)
+                    if match:
+                        return match.group(1)
+                class_attr = wistia_embed.get_attribute('class')
+                if class_attr:
+                    match = re.search(r'wistia_async_([a-zA-Z0-9]+)', class_attr)
+                    if match:
+                        return match.group(1)
+
+            # Method 3: Look for data attributes
+            data_elem = page.query_selector('[data-wistia-id]')
+            if data_elem:
+                return data_elem.get_attribute('data-wistia-id')
+
+            # Method 4: Execute JavaScript to get Wistia video data
+            try:
+                wistia_data = page.evaluate('''() => {
+                    if (window.Wistia && window.Wistia.api) {
+                        const videos = window.Wistia.api.all();
+                        if (videos && videos.length > 0) {
+                            return videos[0].hashedId();
+                        }
+                    }
+                    // Try finding it in the DOM
+                    const elem = document.querySelector('[class*="wistia_async_"]');
+                    if (elem) {
+                        const match = elem.className.match(/wistia_async_([a-zA-Z0-9]+)/);
+                        if (match) return match[1];
+                    }
+                    return null;
+                }''')
+                if wistia_data:
+                    return wistia_data
+            except:
+                pass
+
+            # Method 5: Check page content for Wistia patterns
+            content = page.content()
+            patterns = [
+                r'wistia_async_([a-zA-Z0-9]+)',
+                r'wistia\.com/embed/medias/([a-zA-Z0-9]+)',
+                r'"hashedId"\s*:\s*"([a-zA-Z0-9]+)"',
+                r'Wistia\.embed\(["\']([a-zA-Z0-9]+)["\']',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, content)
+                if match:
+                    return match.group(1)
+
+        except Exception as e:
+            print(f"  Error extracting Wistia ID: {e}")
+
+        return None
 
     def _extract_m3u8_url(self, soup: BeautifulSoup, html_content: str) -> Optional[str]:
         """Extract the M3U8 URL from the page."""
@@ -579,13 +748,26 @@ if __name__ == "__main__":
     cookies = get_session_cookies("https://app.ddssuccess.com")
     if cookies:
         scraper = CourseScraper(cookies)
-        course = scraper.get_course_info(
-            "https://app.ddssuccess.com/courses/art-of-scheduling-productively/lectures/42201128"
-        )
-        if course:
-            print(f"Course: {course.title}")
-            print(f"Sections: {len(course.sections)}")
-            for section in course.sections:
-                print(f"  {section.title}: {len(section.lessons)} lessons")
-                for lesson in section.lessons:
-                    print(f"    - {lesson.title} ({lesson.duration})")
+        try:
+            course = scraper.get_course_info(
+                "https://app.ddssuccess.com/courses/art-of-scheduling-productively/lectures/42201128"
+            )
+            if course:
+                print(f"Course: {course.title}")
+                print(f"Sections: {len(course.sections)}")
+                for section in course.sections:
+                    print(f"  {section.title}: {len(section.lessons)} lessons")
+                    for lesson in section.lessons:
+                        print(f"    - {lesson.title} ({lesson.duration})")
+
+                # Test getting video details for first lesson
+                if course.sections and course.sections[0].lessons:
+                    print("\nTesting video detection for first lesson...")
+                    lesson = course.sections[0].lessons[0]
+                    lesson = scraper.get_lesson_details(lesson)
+                    if lesson.m3u8_url:
+                        print(f"Video found: {lesson.m3u8_url[:80]}...")
+                    else:
+                        print("No video found")
+        finally:
+            scraper.close_browser()

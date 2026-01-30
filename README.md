@@ -44,7 +44,20 @@ cd /path/to/m3u8DownloaderV1
 pip3 install -r requirements.txt
 ```
 
-### Step 3: Grant Keychain Access (First Run Only)
+### Step 3: Install Playwright Browser (One-Time Setup)
+
+The app uses a headless browser to detect videos. Run this once:
+
+```bash
+python3 setup_playwright.py
+```
+
+Or manually:
+```bash
+python3 -m playwright install chromium
+```
+
+### Step 4: Grant Keychain Access (First Run Only)
 
 The app needs to read your Chrome session. On first run, macOS will ask for permission to access Chrome Safe Storage in Keychain. Click "Allow" or "Always Allow".
 

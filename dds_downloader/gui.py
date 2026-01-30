@@ -707,6 +707,10 @@ class DDSDownloaderApp:
         if self.is_downloading and self.downloader:
             self.downloader.cancel_downloads()
 
+        # Close the browser if it was opened
+        if self.scraper:
+            self.scraper.close_browser()
+
         self.root.destroy()
 
 
