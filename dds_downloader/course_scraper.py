@@ -6,7 +6,7 @@ Parses Teachable course pages to extract structure, videos, and downloadable fil
 import re
 import json
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Optional, Callable, Set
 from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
@@ -67,19 +67,17 @@ class CourseScraper:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         })
+        # Track seen URLs to avoid duplicates
+        self._seen_urls: Set[str] = set()
 
     def get_course_info(self, url: str, progress_callback: Optional[Callable] = None) -> Optional[Course]:
         """
         Extract complete course information from a course or lecture URL.
-
-        Args:
-            url: URL to a course page or any lecture within the course
-            progress_callback: Optional callback function for progress updates
-
-        Returns:
-            Course object with all sections, lessons, and file info
         """
         try:
+            # Reset seen URLs for new course scan
+            self._seen_urls = set()
+
             # First, get the course page
             response = self.session.get(url, timeout=30)
             response.raise_for_status()
@@ -120,7 +118,6 @@ class CourseScraper:
         selectors = [
             'h1.course-title',
             '.course-sidebar h2',
-            'h1',
             '.course-name',
             '[data-course-title]',
         ]
@@ -128,7 +125,10 @@ class CourseScraper:
         for selector in selectors:
             element = soup.select_one(selector)
             if element and element.text.strip():
-                return element.text.strip()
+                title = element.text.strip()
+                # Clean up the title
+                title = re.sub(r'\s+', ' ', title)
+                return title
 
         # Fallback: extract from URL
         match = re.search(r'/courses/([^/]+)', url)
@@ -145,29 +145,35 @@ class CourseScraper:
             return f"{parsed.scheme}://{parsed.netloc}{match.group(1)}"
         return url
 
+    def _normalize_url(self, url: str) -> str:
+        """Normalize URL for deduplication."""
+        # Remove trailing slashes and query params for comparison
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip('/')
+
     def _parse_curriculum(self, soup: BeautifulSoup, base_url: str) -> List[Section]:
         """Parse the course curriculum from the sidebar."""
         sections = []
+        self._seen_urls = set()
 
-        # Try to find the curriculum section - Teachable uses various structures
-        # Look for section headers and their lessons
+        # Look for the course sidebar/curriculum structure
+        # Teachable typically uses a specific structure
 
-        # Method 1: Look for section containers
-        section_containers = soup.select('.course-section, .section, [data-section]')
+        # Find all section headers
+        section_headers = soup.select('.course-section .section-title, .section-header, [class*="section-title"]')
 
-        if section_containers:
-            for idx, container in enumerate(section_containers):
-                section = self._parse_section_container(container, base_url, idx)
-                if section:
-                    sections.append(section)
+        if section_headers:
+            # Parse structured sections
+            current_section_elem = None
+            for header in section_headers:
+                # Find the parent section container
+                section_container = header.find_parent(class_=lambda x: x and ('section' in x.lower() if x else False))
+                if section_container:
+                    section = self._parse_section_container(section_container, base_url, len(sections))
+                    if section and section.lessons:
+                        sections.append(section)
 
-        # Method 2: Look for the sidebar list structure
-        if not sections:
-            sidebar = soup.select_one('.course-sidebar, .lecture-list, [class*="curriculum"]')
-            if sidebar:
-                sections = self._parse_sidebar_list(sidebar, base_url)
-
-        # Method 3: Look for individual lecture items and group by section
+        # If no structured sections found, try flat list
         if not sections:
             sections = self._parse_flat_lecture_list(soup, base_url)
 
@@ -176,15 +182,18 @@ class CourseScraper:
     def _parse_section_container(self, container, base_url: str, section_idx: int) -> Optional[Section]:
         """Parse a section container element."""
         # Get section title
-        title_elem = container.select_one('.section-title, .section-header, h3, h4, [class*="section-name"]')
+        title_elem = container.select_one('.section-title, .section-header, h3, h4')
         section_title = title_elem.text.strip() if title_elem else f"Section {section_idx + 1}"
 
-        # Get lessons in this section
-        lesson_items = container.select('.section-item, .lecture-item, li a[href*="/lectures/"]')
+        # Clean up section title
+        section_title = re.sub(r'\s+', ' ', section_title).strip()
+
+        # Get lessons in this section - look for lecture links
+        lesson_links = container.select('a[href*="/lectures/"]')
 
         lessons = []
-        for idx, item in enumerate(lesson_items):
-            lesson = self._parse_lesson_item(item, base_url, idx)
+        for link in lesson_links:
+            lesson = self._parse_lesson_item(link, base_url, len(lessons))
             if lesson:
                 lessons.append(lesson)
 
@@ -193,62 +202,48 @@ class CourseScraper:
 
         return None
 
-    def _parse_sidebar_list(self, sidebar, base_url: str) -> List[Section]:
-        """Parse the sidebar list structure."""
+    def _parse_flat_lecture_list(self, soup: BeautifulSoup, base_url: str) -> List[Section]:
+        """Parse a flat list of lectures, grouping by section headers."""
         sections = []
         current_section = None
-        section_idx = 0
-        lesson_idx = 0
 
-        for element in sidebar.children:
-            if not hasattr(element, 'name') or element.name is None:
-                continue
+        # Find all lecture links
+        all_links = soup.select('a[href*="/lectures/"]')
 
-            # Check if this is a section header
-            if element.name in ['h3', 'h4', 'div'] and 'section' in element.get('class', []):
-                if current_section and current_section.lessons:
-                    sections.append(current_section)
+        for link in all_links:
+            # Check if there's a section header before this link
+            parent = link.find_parent(['li', 'div'])
+            if parent:
+                # Look for a preceding section header
+                prev_siblings = list(parent.find_previous_siblings(['h3', 'h4', 'div']))
+                for sib in prev_siblings:
+                    if 'section' in ' '.join(sib.get('class', [])).lower():
+                        section_title = sib.get_text(strip=True)
+                        if current_section is None or current_section.title != section_title:
+                            if current_section and current_section.lessons:
+                                sections.append(current_section)
+                            current_section = Section(title=section_title, order=len(sections))
+                        break
 
-                current_section = Section(
-                    title=element.text.strip(),
-                    order=section_idx
-                )
-                section_idx += 1
-                lesson_idx = 0
+            if current_section is None:
+                current_section = Section(title="Course Content", order=0)
 
-            # Check if this is a lesson item
-            elif element.name in ['a', 'li', 'div']:
-                link = element if element.name == 'a' else element.select_one('a')
-                if link and '/lectures/' in link.get('href', ''):
-                    lesson = self._parse_lesson_item(link, base_url, lesson_idx)
-                    if lesson:
-                        if current_section is None:
-                            current_section = Section(title="Main Content", order=0)
-                        current_section.lessons.append(lesson)
-                        lesson_idx += 1
+            lesson = self._parse_lesson_item(link, base_url, len(current_section.lessons))
+            if lesson:
+                current_section.lessons.append(lesson)
 
         if current_section and current_section.lessons:
             sections.append(current_section)
 
-        return sections
-
-    def _parse_flat_lecture_list(self, soup: BeautifulSoup, base_url: str) -> List[Section]:
-        """Parse a flat list of lectures without section grouping."""
-        lectures = soup.select('a[href*="/lectures/"]')
-
-        # Try to group by section headers that might be nearby
-        sections = []
-        current_section = Section(title="Course Content", order=0)
-        lesson_idx = 0
-
-        for lecture in lectures:
-            lesson = self._parse_lesson_item(lecture, base_url, lesson_idx)
-            if lesson:
-                current_section.lessons.append(lesson)
-                lesson_idx += 1
-
-        if current_section.lessons:
-            sections.append(current_section)
+        # If still no sections, create one with all lessons
+        if not sections:
+            all_lessons = []
+            for link in all_links:
+                lesson = self._parse_lesson_item(link, base_url, len(all_lessons))
+                if lesson:
+                    all_lessons.append(lesson)
+            if all_lessons:
+                sections.append(Section(title="Course Content", lessons=all_lessons, order=0))
 
         return sections
 
@@ -270,61 +265,86 @@ class CourseScraper:
         # Build full URL
         url = urljoin(base_url, href)
 
-        # Get title
-        title = link.text.strip()
+        # Normalize and check for duplicates
+        normalized_url = self._normalize_url(url)
+        if normalized_url in self._seen_urls:
+            return None  # Skip duplicate
+        self._seen_urls.add(normalized_url)
+
+        # Get title - try multiple approaches
+        title = ""
+
+        # Method 1: Direct link text
+        title = link.get_text(strip=True)
+
+        # Method 2: Look for title in child elements
+        if not title or len(title) < 3:
+            title_elem = link.select_one('.lecture-name, .item-title, span')
+            if title_elem:
+                title = title_elem.get_text(strip=True)
 
         # Clean up title - remove duration if embedded
-        duration_match = re.search(r'\((\d+:\d+)\)', title)
         duration = ""
+        duration_match = re.search(r'\((\d+:\d+)\)', title)
         if duration_match:
             duration = duration_match.group(1)
             title = re.sub(r'\s*\(\d+:\d+\)\s*', '', title).strip()
 
-        # Also check for duration in a separate element
+        # Also look for duration in nearby elements
         if not duration:
-            duration_elem = item.select_one('.duration, .lecture-duration, [class*="time"]')
-            if duration_elem:
-                duration = duration_elem.text.strip()
+            parent = link.find_parent(['li', 'div'])
+            if parent:
+                duration_elem = parent.select_one('.duration, .lecture-duration, [class*="time"]')
+                if duration_elem:
+                    dur_text = duration_elem.get_text(strip=True)
+                    dur_match = re.search(r'(\d+:\d+)', dur_text)
+                    if dur_match:
+                        duration = dur_match.group(1)
 
-        # Check if this is a video or just content
-        is_video = True
-        icon = item.select_one('.fa-video, .fa-play, [class*="video"], svg')
-        if item.select_one('.fa-file-pdf, .fa-file-text, [class*="text"]'):
-            is_video = False
+        # Clean up title
+        title = re.sub(r'\s+', ' ', title).strip()
+
+        if not title:
+            # Extract from URL as fallback
+            match = re.search(r'/lectures/(\d+)', url)
+            if match:
+                title = f"Lecture {match.group(1)}"
+            else:
+                title = f"Lesson {order + 1}"
 
         return Lesson(
             title=title,
             url=url,
             duration=duration,
             order=order,
-            is_video=is_video
+            is_video=True  # Assume video by default
         )
 
     def get_lesson_details(self, lesson: Lesson, progress_callback: Optional[Callable] = None) -> Lesson:
         """
         Fetch detailed information for a lesson including M3U8 URL and downloadable files.
-
-        Args:
-            lesson: Lesson object to populate with details
-            progress_callback: Optional callback for progress updates
-
-        Returns:
-            Updated Lesson object with M3U8 URL and files
         """
         try:
+            print(f"Fetching details for: {lesson.title}")
             response = self.session.get(lesson.url, timeout=30)
             response.raise_for_status()
 
             soup = BeautifulSoup(response.text, 'lxml')
+            html_content = response.text
 
             # Extract M3U8 URL
-            m3u8_url = self._extract_m3u8_url(soup, response.text)
+            m3u8_url = self._extract_m3u8_url(soup, html_content)
             if m3u8_url:
+                print(f"  Found M3U8: {m3u8_url[:80]}...")
                 lesson.m3u8_url = m3u8_url
                 lesson.available_qualities = self._get_available_qualities(m3u8_url)
+            else:
+                print(f"  No M3U8 found for: {lesson.title}")
 
             # Extract downloadable files
             lesson.downloadable_files = self._extract_downloadable_files(soup, lesson.url)
+            if lesson.downloadable_files:
+                print(f"  Found {len(lesson.downloadable_files)} downloadable files")
 
         except Exception as e:
             print(f"Error getting lesson details for {lesson.title}: {e}")
@@ -333,36 +353,73 @@ class CourseScraper:
 
     def _extract_m3u8_url(self, soup: BeautifulSoup, html_content: str) -> Optional[str]:
         """Extract the M3U8 URL from the page."""
-        # Method 1: Look for Wistia embed
-        wistia_match = re.search(r'wistia\.com/embed/medias/([a-zA-Z0-9]+)', html_content)
-        if wistia_match:
-            media_id = wistia_match.group(1)
-            return self._get_wistia_m3u8(media_id)
+
+        # Method 1: Look for Wistia embed (most common on Teachable)
+        # Pattern 1: wistia_async_XXXXX class
+        wistia_class_match = re.search(r'wistia_async_([a-zA-Z0-9]+)', html_content)
+        if wistia_class_match:
+            media_id = wistia_class_match.group(1)
+            print(f"  Found Wistia ID (class): {media_id}")
+            m3u8 = self._get_wistia_m3u8(media_id)
+            if m3u8:
+                return m3u8
+
+        # Pattern 2: wistia.com/embed/medias/XXXXX
+        wistia_embed_match = re.search(r'wistia\.com/embed/medias/([a-zA-Z0-9]+)', html_content)
+        if wistia_embed_match:
+            media_id = wistia_embed_match.group(1)
+            print(f"  Found Wistia ID (embed): {media_id}")
+            m3u8 = self._get_wistia_m3u8(media_id)
+            if m3u8:
+                return m3u8
+
+        # Pattern 3: Wistia JSON config
+        wistia_json_match = re.search(r'"hashedId"\s*:\s*"([a-zA-Z0-9]+)"', html_content)
+        if wistia_json_match:
+            media_id = wistia_json_match.group(1)
+            print(f"  Found Wistia ID (JSON): {media_id}")
+            m3u8 = self._get_wistia_m3u8(media_id)
+            if m3u8:
+                return m3u8
 
         # Method 2: Look for direct M3U8 URL in the page
-        m3u8_match = re.search(r'(https?://[^\s"\']+\.m3u8[^\s"\']*)', html_content)
-        if m3u8_match:
-            return m3u8_match.group(1)
+        m3u8_patterns = [
+            r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)',
+            r'"file"\s*:\s*"([^"]+\.m3u8[^"]*)"',
+            r'"src"\s*:\s*"([^"]+\.m3u8[^"]*)"',
+            r'"hls"\s*:\s*"([^"]+)"',
+            r'"m3u8"\s*:\s*"([^"]+)"',
+        ]
 
-        # Method 3: Look for video source in data attributes
+        for pattern in m3u8_patterns:
+            match = re.search(pattern, html_content)
+            if match:
+                url = match.group(1)
+                if '.m3u8' in url or 'hls' in url.lower():
+                    print(f"  Found direct M3U8: {url[:60]}...")
+                    return url
+
+        # Method 3: Look for video data attributes
         video_elem = soup.select_one('[data-video-url], [data-m3u8], video source[src*=".m3u8"]')
         if video_elem:
-            return video_elem.get('data-video-url') or video_elem.get('data-m3u8') or video_elem.get('src')
+            url = video_elem.get('data-video-url') or video_elem.get('data-m3u8') or video_elem.get('src')
+            if url:
+                print(f"  Found video data attr: {url[:60]}...")
+                return url
 
         # Method 4: Look in script tags for video config
         for script in soup.select('script'):
             if script.string:
-                # Look for various patterns
-                patterns = [
-                    r'"m3u8":\s*"([^"]+)"',
-                    r'"hls":\s*"([^"]+)"',
-                    r'"src":\s*"([^"]+\.m3u8[^"]*)"',
-                    r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                ]
-                for pattern in patterns:
-                    match = re.search(pattern, script.string)
-                    if match:
-                        return match.group(1)
+                script_text = script.string
+
+                # Look for Wistia media ID in script
+                wistia_script_match = re.search(r'Wistia\.embed\(["\']([a-zA-Z0-9]+)["\']', script_text)
+                if wistia_script_match:
+                    media_id = wistia_script_match.group(1)
+                    print(f"  Found Wistia ID (script): {media_id}")
+                    m3u8 = self._get_wistia_m3u8(media_id)
+                    if m3u8:
+                        return m3u8
 
         return None
 
@@ -371,6 +428,8 @@ class CourseScraper:
         try:
             # Wistia's embed info endpoint
             info_url = f"https://fast.wistia.com/embed/medias/{media_id}.json"
+            print(f"  Fetching Wistia info: {info_url}")
+
             response = self.session.get(info_url, timeout=10)
 
             if response.status_code == 200:
@@ -378,18 +437,34 @@ class CourseScraper:
                 media = data.get('media', {})
                 assets = media.get('assets', [])
 
-                # Find the HLS asset
+                # Find the HLS/M3U8 asset
                 for asset in assets:
-                    if asset.get('type') == 'hls':
-                        return asset.get('url')
-
-                    # Also check for m3u8 in the URL
+                    asset_type = asset.get('type', '')
                     url = asset.get('url', '')
-                    if '.m3u8' in url:
+
+                    if asset_type == 'hls' or asset_type == 'm3u8':
+                        print(f"  Found HLS asset: {url[:60]}...")
                         return url
 
+                    if '.m3u8' in url:
+                        print(f"  Found M3U8 in asset: {url[:60]}...")
+                        return url
+
+                # If no HLS found, look for original or mp4
+                print(f"  Available asset types: {[a.get('type') for a in assets]}")
+
+                # Try to construct HLS URL from other assets
+                for asset in assets:
+                    if asset.get('type') == 'original':
+                        # Wistia HLS URL pattern
+                        hls_url = f"https://fast.wistia.com/embed/medias/{media_id}.m3u8"
+                        return hls_url
+
+            else:
+                print(f"  Wistia API returned status: {response.status_code}")
+
         except Exception as e:
-            print(f"Error getting Wistia M3U8: {e}")
+            print(f"  Error getting Wistia M3U8: {e}")
 
         return None
 
@@ -403,17 +478,14 @@ class CourseScraper:
                 content = response.text
 
                 # Parse resolution information
-                resolution_pattern = r'RESOLUTION=(\d+x\d+)'
-                bandwidth_pattern = r'BANDWIDTH=(\d+)'
+                resolution_pattern = r'RESOLUTION=(\d+)x(\d+)'
+                matches = re.findall(resolution_pattern, content)
 
-                resolutions = re.findall(resolution_pattern, content)
-                bandwidths = re.findall(bandwidth_pattern, content)
-
-                # Create quality labels
-                for res in set(resolutions):
-                    height = res.split('x')[1]
+                for width, height in matches:
                     qualities.append(f"{height}p")
 
+                # Remove duplicates and sort
+                qualities = list(set(qualities))
                 qualities.sort(key=lambda x: int(x.replace('p', '')), reverse=True)
 
         except Exception as e:
@@ -424,6 +496,7 @@ class CourseScraper:
     def _extract_downloadable_files(self, soup: BeautifulSoup, base_url: str) -> List[DownloadableFile]:
         """Extract downloadable files from the lesson page."""
         files = []
+        found_urls = set()
 
         # Common patterns for download links
         download_selectors = [
@@ -437,10 +510,7 @@ class CourseScraper:
             'a[download]',
             '.attachment a',
             '.download-link',
-            'a[href*="download"]',
         ]
-
-        found_urls = set()
 
         for selector in download_selectors:
             for link in soup.select(selector):
@@ -461,7 +531,7 @@ class CourseScraper:
                     continue
 
                 # Get file name
-                name = link.text.strip() or self._get_filename_from_url(href)
+                name = link.get_text(strip=True) or self._get_filename_from_url(href)
 
                 files.append(DownloadableFile(
                     name=name,
@@ -517,3 +587,5 @@ if __name__ == "__main__":
             print(f"Sections: {len(course.sections)}")
             for section in course.sections:
                 print(f"  {section.title}: {len(section.lessons)} lessons")
+                for lesson in section.lessons:
+                    print(f"    - {lesson.title} ({lesson.duration})")

@@ -533,6 +533,8 @@ class DDSDownloaderApp:
 
             total_items = len(items)
             completed = 0
+            successful = 0
+            skipped = 0
 
             for item in items:
                 if not self.is_downloading:
@@ -544,26 +546,44 @@ class DDSDownloaderApp:
                 if item.is_video:
                     output_path = course_folder / f"{lesson_name}.mp4"
 
-                    # Update status
+                    # Update status - fetching video info
                     self.root.after(0, lambda n=lesson_name: self.progress_label.config(
-                        text=f"Downloading: {n}"
+                        text=f"Fetching video info: {n}"
                     ))
 
                     # First, ensure we have the M3U8 URL
                     if not item.lesson.m3u8_url:
+                        print(f"Fetching M3U8 URL for: {item.lesson.title}")
                         self.scraper.get_lesson_details(item.lesson)
 
                     if item.lesson.m3u8_url:
+                        print(f"Downloading: {item.lesson.title}")
+                        print(f"  M3U8 URL: {item.lesson.m3u8_url[:80]}...")
+
+                        # Update status - downloading
+                        self.root.after(0, lambda n=lesson_name: self.progress_label.config(
+                            text=f"Downloading: {n}"
+                        ))
+
                         success = self.downloader.download_m3u8_video(
                             item.lesson.m3u8_url,
                             output_path,
                             self.quality_var.get(),
                             item.item_id
                         )
+                        if success:
+                            successful += 1
+                            print(f"  Success: {output_path}")
+                        else:
+                            print(f"  Failed to download: {item.lesson.title}")
                     else:
+                        print(f"No M3U8 URL found for: {item.lesson.title}")
+                        skipped += 1
                         self.root.after(0, lambda n=lesson_name: self.progress_label.config(
                             text=f"Skipped (no video found): {n}"
                         ))
+                        import time
+                        time.sleep(0.5)  # Brief pause so user can see the message
                 else:
                     # Download file
                     if item.file:
@@ -579,15 +599,20 @@ class DDSDownloaderApp:
                             output_path,
                             item.item_id
                         )
+                        if success:
+                            successful += 1
 
                 completed += 1
                 overall_progress = (completed / total_items) * 100
                 self.root.after(0, lambda p=overall_progress: self.progress_var.set(p))
 
-            # Done
-            self.root.after(0, self._download_complete)
+            # Done - show summary
+            print(f"Download complete: {successful} successful, {skipped} skipped")
+            self.root.after(0, lambda: self._download_complete_with_summary(successful, skipped))
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.root.after(0, lambda: messagebox.showerror("Error", f"Download error: {e}"))
             self.root.after(0, self._download_complete)
 
@@ -612,6 +637,27 @@ class DDSDownloaderApp:
 
         self.progress_label.config(text="Download complete!")
         messagebox.showinfo("Complete", "Download finished!")
+
+    def _download_complete_with_summary(self, successful: int, skipped: int):
+        """Called when download is complete, with summary."""
+        self.is_downloading = False
+        self.download_btn.config(state=tk.NORMAL)
+        self.scan_btn.config(state=tk.NORMAL)
+        self.pause_btn.config(state=tk.DISABLED)
+        self.cancel_btn.config(state=tk.DISABLED)
+        self.force_resume_btn.config(state=tk.DISABLED)
+
+        self.progress_label.config(text=f"Complete: {successful} downloaded, {skipped} skipped")
+
+        if skipped > 0:
+            messagebox.showinfo(
+                "Download Complete",
+                f"Downloaded: {successful} files\n"
+                f"Skipped: {skipped} files (no video URL found)\n\n"
+                "Check Terminal for details on skipped files."
+            )
+        else:
+            messagebox.showinfo("Complete", f"Successfully downloaded {successful} files!")
 
     def _toggle_pause(self):
         """Toggle pause/resume."""
