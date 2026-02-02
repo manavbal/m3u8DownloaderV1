@@ -251,10 +251,20 @@ class Downloader:
         # Use a temporary file to avoid partial downloads
         temp_output = output_path.with_suffix('.tmp.mp4')
 
+        # Build headers string for FFmpeg
+        # Hotmart requires specific headers to allow downloads
+        headers = [
+            f'Cookie: {cookie_header}',
+            'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer: https://player.hotmart.com/',
+            'Origin: https://player.hotmart.com',
+        ]
+        headers_str = '\r\n'.join(headers) + '\r\n'
+
         cmd = [
             'ffmpeg',
             '-y',  # Overwrite output
-            '-headers', f'Cookie: {cookie_header}\r\n',
+            '-headers', headers_str,
             '-i', stream_url,
             '-c', 'copy',  # Copy streams without re-encoding
             '-bsf:a', 'aac_adtstoasc',  # Fix audio for MP4

@@ -410,7 +410,10 @@ class CourseScraper:
 
                     if video_data.get('video_url'):
                         # Direct video URL (Hotmart)
+                        # Decode any escaped unicode characters (like \u0026 -> &)
                         m3u8_url = video_data['video_url']
+                        if '\\u' in m3u8_url:
+                            m3u8_url = m3u8_url.encode().decode('unicode_escape')
                         print(f"  Found {video_type} video URL via Playwright")
 
                     elif video_data.get('video_id'):
