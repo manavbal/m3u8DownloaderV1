@@ -78,8 +78,15 @@ class CourseScraper:
         """No-op - browser runs as subprocess now."""
         pass
 
-    def _extract_wistia_via_subprocess(self, url: str) -> Optional[str]:
-        """Extract Wistia video ID using a subprocess (avoids threading issues)."""
+    def _extract_video_via_subprocess(self, url: str) -> Optional[dict]:
+        """Extract video URL/ID using a subprocess (avoids threading issues).
+
+        Returns dict with either:
+        - {'type': 'wistia', 'video_id': '...'} - need to fetch M3U8 from Wistia API
+        - {'type': 'hotmart', 'video_url': '...'} - direct video URL
+        - {'type': 'hotmart_mp4', 'video_url': '...'} - direct MP4 URL
+        - None if extraction failed
+        """
         try:
             # Find the wistia_extractor.py script
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -98,14 +105,18 @@ class CourseScraper:
                 [sys.executable, extractor_path, url, cookies_json],
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=90  # Longer timeout for Hotmart
             )
 
             if result.returncode == 0 and result.stdout:
                 try:
                     data = json.loads(result.stdout.strip())
-                    if data.get('success') and data.get('video_id'):
-                        return data['video_id']
+                    if data.get('success'):
+                        video_type = data.get('type', 'unknown')
+                        if data.get('video_url'):
+                            return {'type': video_type, 'video_url': data['video_url']}
+                        elif data.get('video_id'):
+                            return {'type': video_type, 'video_id': data['video_id']}
                     elif data.get('error'):
                         print(f"  Extractor error: {data['error']}")
                 except json.JSONDecodeError:
@@ -375,6 +386,7 @@ class CourseScraper:
         """
         Fetch detailed information for a lesson including M3U8 URL and downloadable files.
         Uses subprocess to run Playwright (avoids threading issues with tkinter).
+        Supports both Wistia and Hotmart video players.
         """
         try:
             print(f"Fetching details for: {lesson.title}")
@@ -385,23 +397,34 @@ class CourseScraper:
             html_content = response.text
             soup = BeautifulSoup(html_content, 'lxml')
 
-            # First try to find Wistia ID in static HTML
+            # First try to find video in static HTML
             m3u8_url = self._extract_m3u8_url(soup, html_content)
 
-            # If no M3U8 found in static HTML, try Playwright via subprocess
+            # If no video found in static HTML, try Playwright via subprocess
             if not m3u8_url:
                 print(f"  No video in static HTML, trying Playwright...")
-                wistia_id = self._extract_wistia_via_subprocess(lesson.url)
-                if wistia_id:
-                    print(f"  Found Wistia ID via Playwright: {wistia_id}")
-                    m3u8_url = self._get_wistia_m3u8(wistia_id)
+                video_data = self._extract_video_via_subprocess(lesson.url)
+
+                if video_data:
+                    video_type = video_data.get('type', 'unknown')
+
+                    if video_data.get('video_url'):
+                        # Direct video URL (Hotmart)
+                        m3u8_url = video_data['video_url']
+                        print(f"  Found {video_type} video URL via Playwright")
+
+                    elif video_data.get('video_id'):
+                        # Wistia ID - need to fetch M3U8 URL
+                        wistia_id = video_data['video_id']
+                        print(f"  Found Wistia ID via Playwright: {wistia_id}")
+                        m3u8_url = self._get_wistia_m3u8(wistia_id)
 
             if m3u8_url:
-                print(f"  Found M3U8: {m3u8_url[:80]}...")
+                print(f"  Found video: {m3u8_url[:80]}...")
                 lesson.m3u8_url = m3u8_url
                 lesson.available_qualities = self._get_available_qualities(m3u8_url)
             else:
-                print(f"  No M3U8 found for: {lesson.title}")
+                print(f"  No video found for: {lesson.title}")
 
             # Extract downloadable files
             lesson.downloadable_files = self._extract_downloadable_files(soup, lesson.url)

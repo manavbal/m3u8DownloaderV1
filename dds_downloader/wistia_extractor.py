@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Wistia Video ID Extractor using Playwright.
+Video Extractor using Playwright.
+Supports: Wistia, Hotmart, and direct video URLs.
 This runs as a separate process to avoid threading issues with tkinter.
 
-Usage: python3 wistia_extractor.py <url> <cookies_json>
-Output: JSON with video_id or error
+Usage: python3 wistia_extractor.py <url> <cookies_json> [--debug]
+Output: JSON with video_url/video_id or error
 """
 
 import sys
@@ -13,8 +14,93 @@ import re
 import time
 
 
-def extract_wistia_id(url: str, cookies: dict, debug: bool = False) -> dict:
-    """Extract Wistia video ID from a page using Playwright."""
+def extract_hotmart_video(page, iframe_src: str) -> dict:
+    """Extract video URL from Hotmart player iframe."""
+    try:
+        # Navigate to the Hotmart player page directly
+        page.goto(iframe_src, wait_until='networkidle', timeout=30000)
+        time.sleep(3)
+
+        # Method 1: Look for video source in the player
+        video_url = None
+
+        # Try to find the video element
+        video_elem = page.query_selector('video')
+        if video_elem:
+            video_url = video_elem.get_attribute('src')
+            if video_url:
+                return {"success": True, "video_url": video_url, "type": "hotmart"}
+
+        # Method 2: Look for HLS source in page content
+        content = page.content()
+
+        # Look for m3u8 URLs in the page
+        m3u8_patterns = [
+            r'"(https?://[^"]+\.m3u8[^"]*)"',
+            r"'(https?://[^']+\.m3u8[^']*)'",
+            r'src:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'source:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+        ]
+
+        for pattern in m3u8_patterns:
+            match = re.search(pattern, content)
+            if match:
+                video_url = match.group(1)
+                return {"success": True, "video_url": video_url, "type": "hotmart"}
+
+        # Method 3: Look for MP4 URLs
+        mp4_patterns = [
+            r'"(https?://[^"]+\.mp4[^"]*)"',
+            r"'(https?://[^']+\.mp4[^']*)'",
+        ]
+
+        for pattern in mp4_patterns:
+            match = re.search(pattern, content)
+            if match:
+                video_url = match.group(1)
+                # Filter out small files (likely thumbnails)
+                if 'thumb' not in video_url.lower() and 'preview' not in video_url.lower():
+                    return {"success": True, "video_url": video_url, "type": "hotmart_mp4"}
+
+        # Method 4: Execute JavaScript to get player config
+        try:
+            player_data = page.evaluate('''() => {
+                // Look for common video player configurations
+                if (window.playerConfig) return JSON.stringify(window.playerConfig);
+                if (window.videoConfig) return JSON.stringify(window.videoConfig);
+                if (window.player && window.player.getConfig) return JSON.stringify(window.player.getConfig());
+
+                // Look for video sources in the DOM
+                const videos = document.querySelectorAll('video source');
+                const sources = [];
+                videos.forEach(v => sources.push(v.src));
+                if (sources.length > 0) return JSON.stringify({sources: sources});
+
+                return null;
+            }''')
+            if player_data:
+                try:
+                    data = json.loads(player_data)
+                    # Look for URLs in the data
+                    data_str = json.dumps(data)
+                    for pattern in m3u8_patterns + mp4_patterns:
+                        match = re.search(pattern, data_str)
+                        if match:
+                            return {"success": True, "video_url": match.group(1), "type": "hotmart"}
+                except:
+                    pass
+        except:
+            pass
+
+        return {"success": False, "error": "Could not extract Hotmart video URL"}
+
+    except Exception as e:
+        return {"success": False, "error": f"Hotmart extraction error: {str(e)}"}
+
+
+def extract_video(url: str, cookies: dict, debug: bool = False) -> dict:
+    """Extract video URL from a page using Playwright."""
     try:
         from playwright.sync_api import sync_playwright
 
@@ -45,9 +131,30 @@ def extract_wistia_id(url: str, cookies: dict, debug: bool = False) -> dict:
             page = context.new_page()
             page.goto(url, wait_until='networkidle', timeout=30000)
 
-            # Wait longer for Wistia to load - it can be slow
+            # Wait for video players to load
             time.sleep(5)
 
+            # First, check for Hotmart player (this is what DDS Success uses)
+            hotmart_iframe = None
+            try:
+                iframes = page.query_selector_all('iframe')
+                for iframe in iframes:
+                    src = iframe.get_attribute('src') or ''
+                    if 'player.hotmart.com' in src:
+                        hotmart_iframe = src
+                        break
+            except:
+                pass
+
+            if hotmart_iframe:
+                # Found Hotmart player - extract from it
+                result = extract_hotmart_video(page, hotmart_iframe)
+                browser.close()
+                if result.get('success'):
+                    return result
+                # If Hotmart extraction failed, continue to try other methods
+
+            # Check for Wistia
             wistia_id = None
 
             # Method 1: Look for wistia_async_ class in the DOM
@@ -171,17 +278,24 @@ def extract_wistia_id(url: str, cookies: dict, debug: bool = False) -> dict:
                     });
                     return info;
                 }''')
-                return {"success": False, "error": "No Wistia video found", "debug": video_info, "debug_file": "/tmp/playwright_debug.html"}
+                browser.close()
+                return {"success": False, "error": "No video found", "debug": video_info, "debug_file": "/tmp/playwright_debug.html"}
 
             browser.close()
 
             if wistia_id:
-                return {"success": True, "video_id": wistia_id}
+                return {"success": True, "video_id": wistia_id, "type": "wistia"}
             else:
-                return {"success": False, "error": "No Wistia video found"}
+                return {"success": False, "error": "No video found"}
 
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# Keep old function name for backwards compatibility
+def extract_wistia_id(url: str, cookies: dict, debug: bool = False) -> dict:
+    """Backwards compatible wrapper."""
+    return extract_video(url, cookies, debug)
 
 
 def main():
@@ -199,7 +313,7 @@ def main():
         print(json.dumps({"success": False, "error": f"Invalid cookies JSON: {e}"}))
         sys.exit(1)
 
-    result = extract_wistia_id(url, cookies, debug=debug)
+    result = extract_video(url, cookies, debug=debug)
     print(json.dumps(result))
 
 
