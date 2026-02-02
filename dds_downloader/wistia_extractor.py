@@ -13,7 +13,7 @@ import re
 import time
 
 
-def extract_wistia_id(url: str, cookies: dict) -> dict:
+def extract_wistia_id(url: str, cookies: dict, debug: bool = False) -> dict:
     """Extract Wistia video ID from a page using Playwright."""
     try:
         from playwright.sync_api import sync_playwright
@@ -26,15 +26,17 @@ def extract_wistia_id(url: str, cookies: dict) -> dict:
                 user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             )
 
-            # Add cookies
+            # Add cookies - need to handle multiple domains
             cookie_list = []
             for name, value in cookies.items():
-                cookie_list.append({
-                    'name': name,
-                    'value': value,
-                    'domain': '.ddssuccess.com',
-                    'path': '/'
-                })
+                # Add for both domains
+                for domain in ['.ddssuccess.com', 'app.ddssuccess.com']:
+                    cookie_list.append({
+                        'name': name,
+                        'value': value,
+                        'domain': domain,
+                        'path': '/'
+                    })
 
             if cookie_list:
                 context.add_cookies(cookie_list)
@@ -43,8 +45,8 @@ def extract_wistia_id(url: str, cookies: dict) -> dict:
             page = context.new_page()
             page.goto(url, wait_until='networkidle', timeout=30000)
 
-            # Wait for Wistia to load
-            time.sleep(3)
+            # Wait longer for Wistia to load - it can be slow
+            time.sleep(5)
 
             wistia_id = None
 
@@ -117,6 +119,8 @@ def extract_wistia_id(url: str, cookies: dict) -> dict:
                         r'wistia\.com/embed/medias/([a-zA-Z0-9]+)',
                         r'"hashedId"\s*:\s*"([a-zA-Z0-9]+)"',
                         r'Wistia\.embed\(["\']([a-zA-Z0-9]+)["\']',
+                        r'wistia_responsive_padding.*?wistia_async_([a-zA-Z0-9]+)',
+                        r'medias/([a-zA-Z0-9]+)\.jsonp',
                     ]
                     for pattern in patterns:
                         match = re.search(pattern, content)
@@ -125,6 +129,49 @@ def extract_wistia_id(url: str, cookies: dict) -> dict:
                             break
                 except:
                     pass
+
+            # Method 6: Check for iframe with Wistia embed
+            if not wistia_id:
+                try:
+                    iframes = page.query_selector_all('iframe')
+                    for iframe in iframes:
+                        src = iframe.get_attribute('src') or ''
+                        if 'wistia' in src:
+                            match = re.search(r'/medias/([a-zA-Z0-9]+)', src)
+                            if match:
+                                wistia_id = match.group(1)
+                                break
+                except:
+                    pass
+
+            # Debug: save page content if no video found
+            if not wistia_id and debug:
+                content = page.content()
+                with open('/tmp/playwright_debug.html', 'w') as f:
+                    f.write(content)
+                # Also check what video-related elements exist
+                video_info = page.evaluate('''() => {
+                    const info = {
+                        iframes: [],
+                        videos: [],
+                        wistiaElems: [],
+                        scripts: []
+                    };
+                    document.querySelectorAll('iframe').forEach(el => {
+                        info.iframes.push(el.src || el.getAttribute('data-src') || 'no-src');
+                    });
+                    document.querySelectorAll('video').forEach(el => {
+                        info.videos.push(el.src || 'no-src');
+                    });
+                    document.querySelectorAll('[class*="wistia"]').forEach(el => {
+                        info.wistiaElems.push(el.className);
+                    });
+                    document.querySelectorAll('script[src*="wistia"]').forEach(el => {
+                        info.scripts.push(el.src);
+                    });
+                    return info;
+                }''')
+                return {"success": False, "error": "No Wistia video found", "debug": video_info, "debug_file": "/tmp/playwright_debug.html"}
 
             browser.close()
 
@@ -139,11 +186,12 @@ def extract_wistia_id(url: str, cookies: dict) -> dict:
 
 def main():
     if len(sys.argv) < 3:
-        print(json.dumps({"success": False, "error": "Usage: wistia_extractor.py <url> <cookies_json>"}))
+        print(json.dumps({"success": False, "error": "Usage: wistia_extractor.py <url> <cookies_json> [--debug]"}))
         sys.exit(1)
 
     url = sys.argv[1]
     cookies_json = sys.argv[2]
+    debug = "--debug" in sys.argv
 
     try:
         cookies = json.loads(cookies_json)
@@ -151,7 +199,7 @@ def main():
         print(json.dumps({"success": False, "error": f"Invalid cookies JSON: {e}"}))
         sys.exit(1)
 
-    result = extract_wistia_id(url, cookies)
+    result = extract_wistia_id(url, cookies, debug=debug)
     print(json.dumps(result))
 
 
