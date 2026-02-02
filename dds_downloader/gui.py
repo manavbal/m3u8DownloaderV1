@@ -51,6 +51,7 @@ class DDSDownloaderApp:
         self.downloader: Optional[Downloader] = None
         self.is_downloading = False
         self.scraper: Optional[CourseScraper] = None
+        self._stop_scanning = False  # Flag to stop background scanning
 
         # Set window geometry
         width, height, x, y = self.settings.get_window_geometry()
@@ -401,13 +402,22 @@ class DDSDownloaderApp:
         if not self.course or not self.scraper:
             return
 
+        self._stop_scanning = False  # Reset flag
+
         def scan_thread():
             total_lessons = sum(len(s.lessons) for s in self.course.sections)
             scanned = 0
 
             for section in self.course.sections:
                 for lesson in section.lessons:
-                    if lesson.is_video:
+                    # Stop if downloading started or stop flag set
+                    if self._stop_scanning or self.is_downloading:
+                        self.root.after(0, lambda: self.status_var.set(
+                            f"Scanning stopped - download in progress"
+                        ))
+                        return
+
+                    if lesson.is_video and not lesson.m3u8_url:
                         self.root.after(0, lambda l=lesson: self.status_var.set(
                             f"Scanning: {l.title}..."
                         ))
@@ -428,22 +438,23 @@ class DDSDownloaderApp:
 
                     scanned += 1
 
-            # Update status when done
-            file_count = sum(
-                len(lesson.downloadable_files)
-                for section in self.course.sections
-                for lesson in section.lessons
-            )
+            # Update status when done (only if not stopped)
+            if not self._stop_scanning and not self.is_downloading:
+                file_count = sum(
+                    len(lesson.downloadable_files)
+                    for section in self.course.sections
+                    for lesson in section.lessons
+                )
 
-            self.root.after(0, lambda: self.status_var.set(
-                f"Ready: {self.course.title} - "
-                f"{len(self.course.sections)} sections, "
-                f"{self.course.total_videos} videos, "
-                f"{file_count} files"
-            ))
+                self.root.after(0, lambda: self.status_var.set(
+                    f"Ready: {self.course.title} - "
+                    f"{len(self.course.sections)} sections, "
+                    f"{self.course.total_videos} videos, "
+                    f"{file_count} files"
+                ))
 
-            # Refresh the display to show newly found files
-            self.root.after(0, self._refresh_file_list)
+                # Refresh the display to show newly found files
+                self.root.after(0, self._refresh_file_list)
 
         thread = threading.Thread(target=scan_thread)
         thread.daemon = True
@@ -503,6 +514,9 @@ class DDSDownloaderApp:
         # Save settings
         self.settings.last_download_folder = output_dir
         self.settings.preferred_quality = self.quality_var.get()
+
+        # Stop background scanning
+        self._stop_scanning = True
 
         # Update UI
         self.is_downloading = True
