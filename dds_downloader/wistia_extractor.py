@@ -16,154 +16,204 @@ import re
 import time
 
 
-def extract_hotmart_video(page, context, iframe_src: str, debug: bool = False) -> dict:
-    """Extract video URL from Hotmart player by intercepting network requests."""
-    captured_urls = []
+def extract_hotmart_video_via_network(page, context, iframe_src: str, debug: bool = False) -> dict:
+    """Extract video URL from Hotmart player by intercepting network requests during playback."""
+    captured_m3u8_urls = []
+    captured_segment_urls = []
 
     def handle_request(request):
-        """Capture M3U8 requests."""
+        """Capture video-related requests."""
         url = request.url
-        if '.m3u8' in url and 'master' in url.lower():
-            captured_urls.append(url)
+        if '.m3u8' in url:
+            captured_m3u8_urls.append(url)
             if debug:
-                print(f"DEBUG: Captured M3U8 URL: {url[:100]}...", file=sys.stderr)
+                print(f"DEBUG: [REQUEST] M3U8: {url[:120]}...", file=sys.stderr)
+        elif '.ts' in url or '.mp4' in url:
+            captured_segment_urls.append(url)
+            if debug and len(captured_segment_urls) <= 3:
+                print(f"DEBUG: [REQUEST] Segment: {url[:80]}...", file=sys.stderr)
 
     def handle_response(response):
-        """Capture M3U8 responses."""
+        """Capture video-related responses."""
         url = response.url
+        status = response.status
         if '.m3u8' in url:
-            captured_urls.append(url)
             if debug:
-                print(f"DEBUG: Captured M3U8 response: {url[:100]}...", file=sys.stderr)
+                print(f"DEBUG: [RESPONSE] M3U8 (status={status}): {url[:120]}...", file=sys.stderr)
+            if status == 200:
+                captured_m3u8_urls.append(url)
 
     try:
-        # Set up request interception
-        page.on('request', handle_request)
-        page.on('response', handle_response)
+        # Create a new page for the iframe to avoid conflicts
+        iframe_page = context.new_page()
 
-        # Navigate to the Hotmart player page
+        # Set up request/response interception BEFORE navigation
+        iframe_page.on('request', handle_request)
+        iframe_page.on('response', handle_response)
+
         if debug:
-            print(f"DEBUG: Navigating to iframe: {iframe_src}", file=sys.stderr)
+            print(f"DEBUG: Navigating to Hotmart player iframe...", file=sys.stderr)
 
-        page.goto(iframe_src, wait_until='networkidle', timeout=45000)
+        # Navigate to the Hotmart player
+        iframe_page.goto(iframe_src, wait_until='domcontentloaded', timeout=30000)
 
-        # Wait for video to potentially start loading
-        time.sleep(3)
+        # Wait for initial load
+        time.sleep(2)
 
-        # Try to click play button if video hasn't started
+        if debug:
+            print(f"DEBUG: Page loaded, attempting to trigger playback...", file=sys.stderr)
+
+        # Try multiple methods to trigger video playback
+        playback_triggered = False
+
+        # Method 1: Click the big play button
         try:
-            play_button = page.query_selector('button[aria-label*="Play"], .play-button, .vjs-big-play-button, [class*="play"]')
-            if play_button:
-                play_button.click()
-                time.sleep(3)  # Wait for video to start loading
-        except:
-            pass
+            play_selectors = [
+                'button.vjs-big-play-button',
+                '.vjs-big-play-button',
+                'button[aria-label="Play"]',
+                'button[aria-label="Play Video"]',
+                '.play-button',
+                '[class*="play-button"]',
+                '[class*="PlayButton"]',
+                'button[class*="play"]',
+                '.video-js .vjs-control-bar button',
+            ]
+            for selector in play_selectors:
+                try:
+                    elem = iframe_page.query_selector(selector)
+                    if elem and elem.is_visible():
+                        if debug:
+                            print(f"DEBUG: Found play button: {selector}", file=sys.stderr)
+                        elem.click()
+                        playback_triggered = True
+                        time.sleep(3)
+                        break
+                except:
+                    continue
+        except Exception as e:
+            if debug:
+                print(f"DEBUG: Play button click failed: {e}", file=sys.stderr)
 
-        # Also try clicking on the video element itself
-        try:
-            video_elem = page.query_selector('video')
-            if video_elem:
-                video_elem.click()
-                time.sleep(2)
-        except:
-            pass
+        # Method 2: Click on the video element
+        if not playback_triggered or not captured_m3u8_urls:
+            try:
+                video = iframe_page.query_selector('video')
+                if video:
+                    if debug:
+                        print(f"DEBUG: Clicking video element...", file=sys.stderr)
+                    video.click()
+                    time.sleep(3)
+            except:
+                pass
 
-        # Check if we captured any M3U8 URLs
-        if captured_urls:
-            # Prefer master playlist URLs
-            for url in captured_urls:
-                if 'master' in url.lower():
-                    return {"success": True, "video_url": url, "type": "hotmart"}
-            # Return first captured URL
-            return {"success": True, "video_url": captured_urls[0], "type": "hotmart"}
-
-        # Fallback: Look for video source in the player
-        video_elem = page.query_selector('video')
-        if video_elem:
-            video_url = video_elem.get_attribute('src')
-            if video_url and ('http' in video_url):
-                return {"success": True, "video_url": video_url, "type": "hotmart"}
-
-        # Fallback: Look for M3U8 URLs in page content
-        content = page.content()
-
-        m3u8_patterns = [
-            r'"(https?://[^"]+\.m3u8\?[^"]+)"',  # M3U8 with query params
-            r"'(https?://[^']+\.m3u8\?[^']+)'",
-            r'"(https?://[^"]+\.m3u8[^"]*)"',
-            r"'(https?://[^']+\.m3u8[^']*)'",
-        ]
-
-        for pattern in m3u8_patterns:
-            matches = re.findall(pattern, content)
-            for match in matches:
-                # Prefer URLs with query parameters (authenticated)
-                if '?' in match and 'Policy' in match:
-                    return {"success": True, "video_url": match, "type": "hotmart"}
-            for match in matches:
-                if '?' in match:
-                    return {"success": True, "video_url": match, "type": "hotmart"}
-
-        # Method: Execute JavaScript to get player config
-        try:
-            player_data = page.evaluate('''() => {
-                // Look for HLS.js instance
-                if (window.Hls && window.Hls.DefaultConfig) {
-                    const videos = document.querySelectorAll('video');
-                    for (const video of videos) {
-                        if (video.src) return video.src;
+        # Method 3: Use JavaScript to play
+        if not captured_m3u8_urls:
+            try:
+                if debug:
+                    print(f"DEBUG: Trying JavaScript play()...", file=sys.stderr)
+                iframe_page.evaluate('''() => {
+                    const video = document.querySelector('video');
+                    if (video) {
+                        video.muted = true;
+                        video.play().catch(() => {});
                     }
-                }
+                }''')
+                time.sleep(3)
+            except:
+                pass
 
-                // Look for video.js player
-                if (window.videojs) {
-                    const players = window.videojs.getPlayers();
-                    for (const id in players) {
-                        const player = players[id];
-                        if (player && player.src) {
-                            const src = player.src();
-                            if (src) return src;
+        # Method 4: Try to extract HLS source from video.js player
+        if not captured_m3u8_urls:
+            try:
+                if debug:
+                    print(f"DEBUG: Trying to get URL from player...", file=sys.stderr)
+                player_src = iframe_page.evaluate('''() => {
+                    // Try video.js
+                    if (window.videojs) {
+                        const players = videojs.getPlayers();
+                        for (const id in players) {
+                            const p = players[id];
+                            if (p && p.tech_ && p.tech_.hls && p.tech_.hls.playlists) {
+                                const master = p.tech_.hls.playlists.master;
+                                if (master && master.uri) return master.uri;
+                            }
+                            if (p && p.currentSrc) {
+                                const src = p.currentSrc();
+                                if (src && src.includes('.m3u8')) return src;
+                            }
                         }
                     }
-                }
+                    // Try HLS.js
+                    if (window.Hls) {
+                        const videos = document.querySelectorAll('video');
+                        for (const v of videos) {
+                            if (v._hls && v._hls.url) return v._hls.url;
+                        }
+                    }
+                    // Try video src directly
+                    const video = document.querySelector('video');
+                    if (video && video.src && video.src.includes('.m3u8')) {
+                        return video.src;
+                    }
+                    return null;
+                }''')
+                if player_src:
+                    if debug:
+                        print(f"DEBUG: Got URL from player: {player_src[:80]}...", file=sys.stderr)
+                    captured_m3u8_urls.append(player_src)
+            except Exception as e:
+                if debug:
+                    print(f"DEBUG: Player source extraction failed: {e}", file=sys.stderr)
 
-                // Look for any video source
-                const video = document.querySelector('video');
-                if (video) {
-                    if (video.src) return video.src;
-                    const source = video.querySelector('source');
-                    if (source && source.src) return source.src;
-                }
+        # Method 5: Parse page content for M3U8 URLs with tokens
+        if not captured_m3u8_urls:
+            try:
+                content = iframe_page.content()
+                # Look for M3U8 URLs with authentication tokens
+                patterns = [
+                    r'"(https?://[^"]+\.m3u8\?[^"]+)"',
+                    r"'(https?://[^']+\.m3u8\?[^']+)'",
+                    r'src["\s]*[:=]["\s]*["\']?(https?://[^"\'>\s]+\.m3u8[^"\'>\s]*)',
+                ]
+                for pattern in patterns:
+                    matches = re.findall(pattern, content)
+                    for match in matches:
+                        if 'master' in match.lower() or 'hdnts' in match or '?' in match:
+                            if debug:
+                                print(f"DEBUG: Found M3U8 in content: {match[:80]}...", file=sys.stderr)
+                            captured_m3u8_urls.append(match)
+            except:
+                pass
 
-                // Look in network requests stored in window
-                if (window.__PLAYER_CONFIG__) {
-                    return JSON.stringify(window.__PLAYER_CONFIG__);
-                }
+        iframe_page.close()
 
-                return null;
-            }''')
-
-            if player_data:
-                if player_data.startswith('http'):
-                    return {"success": True, "video_url": player_data, "type": "hotmart"}
-                try:
-                    data = json.loads(player_data)
-                    data_str = json.dumps(data)
-                    for pattern in m3u8_patterns:
-                        match = re.search(pattern, data_str)
-                        if match:
-                            return {"success": True, "video_url": match.group(1), "type": "hotmart"}
-                except:
-                    pass
-        except:
-            pass
-
+        # Analyze captured URLs
         if debug:
-            print(f"DEBUG: No M3U8 found. Captured URLs: {captured_urls}", file=sys.stderr)
+            print(f"DEBUG: Total captured M3U8 URLs: {len(captured_m3u8_urls)}", file=sys.stderr)
+            print(f"DEBUG: Total captured segments: {len(captured_segment_urls)}", file=sys.stderr)
 
-        return {"success": False, "error": "Could not extract Hotmart video URL - no authenticated M3U8 found"}
+        if captured_m3u8_urls:
+            # Prefer URLs with authentication tokens
+            for url in captured_m3u8_urls:
+                if 'hdnts=' in url or 'token=' in url or 'Policy=' in url or 'Signature=' in url:
+                    if debug:
+                        print(f"DEBUG: Selected authenticated URL", file=sys.stderr)
+                    return {"success": True, "video_url": url, "type": "hotmart"}
+
+            # Prefer master playlist
+            for url in captured_m3u8_urls:
+                if 'master' in url.lower():
+                    return {"success": True, "video_url": url, "type": "hotmart"}
+
+            # Return first URL
+            return {"success": True, "video_url": captured_m3u8_urls[0], "type": "hotmart"}
+
+        return {"success": False, "error": "Could not capture video URL from network requests"}
 
     except Exception as e:
+        if debug:
+            print(f"DEBUG: Exception in hotmart extraction: {e}", file=sys.stderr)
         return {"success": False, "error": f"Hotmart extraction error: {str(e)}"}
 
 
@@ -180,10 +230,9 @@ def extract_video(url: str, cookies: dict, debug: bool = False) -> dict:
                 user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             )
 
-            # Add cookies - need to handle multiple domains
+            # Add cookies
             cookie_list = []
             for name, value in cookies.items():
-                # Add for both domains
                 for domain in ['.ddssuccess.com', 'app.ddssuccess.com', '.hotmart.com', 'player.hotmart.com']:
                     cookie_list.append({
                         'name': name,
@@ -195,28 +244,16 @@ def extract_video(url: str, cookies: dict, debug: bool = False) -> dict:
             if cookie_list:
                 context.add_cookies(cookie_list)
 
-            # Set up request interception for the main page too
-            captured_m3u8_urls = []
-
-            def capture_request(request):
-                if '.m3u8' in request.url:
-                    captured_m3u8_urls.append(request.url)
-                    if debug:
-                        print(f"DEBUG: Main page captured: {request.url[:80]}...", file=sys.stderr)
-
-            # Open page
+            # Open main page
             page = context.new_page()
-            page.on('request', capture_request)
 
             if debug:
                 print(f"DEBUG: Loading main page: {url}", file=sys.stderr)
 
             page.goto(url, wait_until='networkidle', timeout=30000)
+            time.sleep(3)
 
-            # Wait for video players to load
-            time.sleep(5)
-
-            # First, check for Hotmart player (this is what DDS Success uses)
+            # Find Hotmart iframe
             hotmart_iframe = None
             try:
                 iframes = page.query_selector_all('iframe')
@@ -231,134 +268,42 @@ def extract_video(url: str, cookies: dict, debug: bool = False) -> dict:
                 pass
 
             if hotmart_iframe:
-                # Found Hotmart player - extract from it with network interception
-                result = extract_hotmart_video(page, context, hotmart_iframe, debug=debug)
+                # Use network interception method for Hotmart
+                result = extract_hotmart_video_via_network(page, context, hotmart_iframe, debug=debug)
                 browser.close()
                 if result.get('success'):
                     return result
-                # If Hotmart extraction failed, check if we captured URLs on main page
-                if captured_m3u8_urls:
-                    for url in captured_m3u8_urls:
-                        if 'master' in url.lower() or '?' in url:
-                            return {"success": True, "video_url": url, "type": "hotmart"}
-                    return {"success": True, "video_url": captured_m3u8_urls[0], "type": "hotmart"}
 
-            # Check for Wistia (keep existing Wistia logic)
+            # Fall back to Wistia detection
             wistia_id = None
 
-            # Method 1: Look for wistia_async_ class in the DOM
+            # Check for Wistia in page
             try:
-                wistia_elem = page.query_selector('[class*="wistia_async_"]')
-                if wistia_elem:
-                    class_attr = wistia_elem.get_attribute('class')
-                    match = re.search(r'wistia_async_([a-zA-Z0-9]+)', class_attr)
+                content = page.content()
+                patterns = [
+                    r'wistia_async_([a-zA-Z0-9]+)',
+                    r'wistia\.com/embed/medias/([a-zA-Z0-9]+)',
+                    r'"hashedId"\s*:\s*"([a-zA-Z0-9]+)"',
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, content)
                     if match:
                         wistia_id = match.group(1)
+                        break
             except:
                 pass
-
-            # Method 2: Look for Wistia embed divs
-            if not wistia_id:
-                try:
-                    wistia_embed = page.query_selector('[class*="wistia_embed"]')
-                    if wistia_embed:
-                        wistia_id_attr = wistia_embed.get_attribute('id')
-                        if wistia_id_attr:
-                            match = re.search(r'wistia_([a-zA-Z0-9]+)', wistia_id_attr)
-                            if match:
-                                wistia_id = match.group(1)
-                        if not wistia_id:
-                            class_attr = wistia_embed.get_attribute('class')
-                            if class_attr:
-                                match = re.search(r'wistia_async_([a-zA-Z0-9]+)', class_attr)
-                                if match:
-                                    wistia_id = match.group(1)
-                except:
-                    pass
-
-            # Method 3: Look for data attributes
-            if not wistia_id:
-                try:
-                    data_elem = page.query_selector('[data-wistia-id]')
-                    if data_elem:
-                        wistia_id = data_elem.get_attribute('data-wistia-id')
-                except:
-                    pass
-
-            # Method 4: Execute JavaScript to get Wistia video data
-            if not wistia_id:
-                try:
-                    wistia_id = page.evaluate('''() => {
-                        if (window.Wistia && window.Wistia.api) {
-                            const videos = window.Wistia.api.all();
-                            if (videos && videos.length > 0) {
-                                return videos[0].hashedId();
-                            }
-                        }
-                        const elem = document.querySelector('[class*="wistia_async_"]');
-                        if (elem) {
-                            const match = elem.className.match(/wistia_async_([a-zA-Z0-9]+)/);
-                            if (match) return match[1];
-                        }
-                        return null;
-                    }''')
-                except:
-                    pass
-
-            # Method 5: Check page content for Wistia patterns
-            if not wistia_id:
-                try:
-                    content = page.content()
-                    patterns = [
-                        r'wistia_async_([a-zA-Z0-9]+)',
-                        r'wistia\.com/embed/medias/([a-zA-Z0-9]+)',
-                        r'"hashedId"\s*:\s*"([a-zA-Z0-9]+)"',
-                        r'Wistia\.embed\(["\']([a-zA-Z0-9]+)["\']',
-                    ]
-                    for pattern in patterns:
-                        match = re.search(pattern, content)
-                        if match:
-                            wistia_id = match.group(1)
-                            break
-                except:
-                    pass
-
-            # Method 6: Check for iframe with Wistia embed
-            if not wistia_id:
-                try:
-                    iframes = page.query_selector_all('iframe')
-                    for iframe in iframes:
-                        src = iframe.get_attribute('src') or ''
-                        if 'wistia' in src:
-                            match = re.search(r'/medias/([a-zA-Z0-9]+)', src)
-                            if match:
-                                wistia_id = match.group(1)
-                                break
-                except:
-                    pass
 
             browser.close()
 
             if wistia_id:
                 return {"success": True, "video_id": wistia_id, "type": "wistia"}
 
-            # Check captured URLs from main page
-            if captured_m3u8_urls:
-                for url in captured_m3u8_urls:
-                    if 'master' in url.lower() or '?' in url:
-                        return {"success": True, "video_url": url, "type": "hotmart"}
-                return {"success": True, "video_url": captured_m3u8_urls[0], "type": "unknown"}
-
             return {"success": False, "error": "No video found"}
 
     except Exception as e:
+        if debug:
+            print(f"DEBUG: Exception: {e}", file=sys.stderr)
         return {"success": False, "error": str(e)}
-
-
-# Keep old function name for backwards compatibility
-def extract_wistia_id(url: str, cookies: dict, debug: bool = False) -> dict:
-    """Backwards compatible wrapper."""
-    return extract_video(url, cookies, debug)
 
 
 def main():
