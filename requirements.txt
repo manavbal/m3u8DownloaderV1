@@ -1,0 +1,29 @@
+# DDS Downloader - Dependencies
+# GUI
+tkinter-tooltip==2.1.0
+
+# Browser automation
+playwright==1.40.0
+
+# Cookie extraction
+browser-cookie3==0.19.1
+
+# HTTP requests
+requests==2.31.0
+aiohttp==3.9.1
+
+# HTML parsing
+beautifulsoup4==4.12.2
+lxml==4.9.3
+
+# M3U8 handling
+m3u8==4.0.0
+
+# Video processing (requires FFmpeg installed separately)
+ffmpeg-python==0.2.0
+
+# Settings persistence
+appdirs==1.4.4
+
+# Crypto for cookie decryption on macOS
+pycryptodome==3.19.0
